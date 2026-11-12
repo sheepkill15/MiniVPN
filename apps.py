@@ -7,6 +7,7 @@ import ipaddress
 import logging
 import os
 import select
+import socket
 import struct
 import subprocess
 import sys
@@ -30,13 +31,26 @@ class TunError(Exception):
     pass
 
 
-def open_tun(name: str, address: str, mtu: int) -> "LinuxTunApplication | WintunApplication":
+def open_tun(
+    name: str, address: str, mtu: int
+) -> "LinuxTunApplication | MacUtunApplication | WintunApplication":
     """Create the virtual interface the way this operating system supports."""
     if sys.platform.startswith("linux"):
         return LinuxTunApplication(name, address, mtu)
+    if sys.platform == "darwin":
+        return MacUtunApplication(name, address, mtu)
     if sys.platform == "win32":
         return WintunApplication(name, address, mtu)
-    raise TunError("TUN mode needs Linux or Windows; use --chat on this system")
+    raise TunError("TUN mode needs Linux, macOS or Windows; use --chat on this system")
+
+
+def _ipv4_interface(address: str) -> ipaddress.IPv4Interface:
+    try:
+        return ipaddress.IPv4Interface(address)
+    except ValueError:
+        raise TunError(
+            f"tun_address {address!r} must be an IPv4 address with a prefix, like 10.8.0.1/24"
+        ) from None
 
 
 class LinuxTunApplication:
@@ -80,6 +94,111 @@ class LinuxTunApplication:
     def close(self) -> None:
         """Nothing to do: the kernel removes the interface when the process exits."""
 
+
+_UTUN_CONTROL_NAME = "com.apple.net.utun_control"
+_UTUN_OPT_IFNAME = 2
+_UTUN_HEADER = struct.Struct(">I")
+_DARWIN_AF_INET = 2
+_DARWIN_AF_INET6 = 30
+
+
+def utun_commands(name: str, address: str, mtu: int) -> list[list[str]]:
+    """The macOS counterpart of `ip addr add` and `ip link set mtu ... up`.
+
+    utun is a point-to-point interface, so the address is given with itself as
+    the destination and the subnet gets an explicit route (as wg-quick does).
+    """
+    interface = _ipv4_interface(address)
+    return [
+        ["ifconfig", name, "inet", str(interface), str(interface.ip), "alias"],
+        ["ifconfig", name, "mtu", str(mtu), "up"],
+        ["route", "-q", "-n", "add", "-inet", str(interface.network), "-interface", name],
+    ]
+
+
+def utun_frame(packet: bytes) -> bytes | None:
+    """Prefix an IP packet with the address family header utun expects."""
+    if not packet:
+        return None
+    version = packet[0] >> 4
+    family = {4: _DARWIN_AF_INET, 6: _DARWIN_AF_INET6}.get(version)
+    if family is None:
+        return None
+    return _UTUN_HEADER.pack(family) + packet
+
+
+def utun_unframe(frame: bytes) -> bytes | None:
+    """Strip the address family header from a packet read from utun."""
+    if len(frame) <= _UTUN_HEADER.size:
+        return None
+    return frame[_UTUN_HEADER.size:]
+
+
+class MacUtunApplication:
+    """Moves IP packets between a macOS utun interface and the tunnel.
+
+    macOS has no /dev/net/tun; a utun interface is created by connecting a
+    kernel control socket. The kernel picks the name (utun0, utun1, ...), and
+    every packet carries a 4-byte address family header.
+    """
+
+    def __init__(self, name: str, address: str, mtu: int) -> None:
+        _ipv4_interface(address)
+        self.mtu = mtu
+        self._sock: socket.socket | None = None
+        try:
+            self._sock = socket.socket(
+                socket.PF_SYSTEM, socket.SOCK_DGRAM, socket.SYSPROTO_CONTROL
+            )
+            self._sock.connect(_UTUN_CONTROL_NAME)
+            raw_name = self._sock.getsockopt(
+                socket.SYSPROTO_CONTROL, _UTUN_OPT_IFNAME, 16
+            )
+            self.name = raw_name.split(b"\0", 1)[0].decode()
+            for command in utun_commands(self.name, address, mtu):
+                subprocess.run(command, check=True, capture_output=True)
+        except PermissionError:
+            self.close()
+            raise TunError(
+                "creating a utun interface needs root; run with sudo or use --chat"
+            ) from None
+        except (OSError, subprocess.CalledProcessError) as error:
+            self.close()
+            raise TunError(f"could not set up a utun interface: {error}") from None
+        if self.name != name:
+            log.info("macOS names utun interfaces itself: using %s, not %s", self.name, name)
+        log.info("interface %s is up with address %s", self.name, address)
+
+    def run(self, runner: Runner) -> None:
+        sock = self._sock
+        while sock is not None and not runner.stopping.is_set():
+            try:
+                ready, _, _ = select.select([sock], [], [], 0.5)
+                frame = sock.recv(self.mtu + 64) if ready else None
+            except (OSError, ValueError):
+                return  # the socket was closed during shutdown
+            packet = utun_unframe(frame) if frame else None
+            if packet is not None:
+                runner.submit(TYPE_IP, packet)
+
+    def deliver(self, packet_type: int, payload: bytes) -> None:
+        if packet_type != TYPE_IP or self._sock is None:
+            return
+        frame = utun_frame(payload)
+        if frame is None:
+            return
+        try:
+            self._sock.send(frame)
+        except OSError:
+            log.debug("kernel rejected a packet from the tunnel")
+
+    def close(self) -> None:
+        """Closing the control socket removes the interface and its routes."""
+        if self._sock is not None:
+            self._sock.close()
+            self._sock = None
+
+
 _WINTUN_RING_CAPACITY = 0x400000  # 4 MiB, a power of two as Wintun requires
 _WINTUN_MAX_PACKET = 0xFFFF
 _ERROR_NO_MORE_ITEMS = 259
@@ -97,12 +216,7 @@ def adapter_guid(name: str) -> bytes:
 
 def netsh_commands(index: int, address: str, mtu: int) -> list[list[str]]:
     """The Windows counterpart of `ip addr add` and `ip link set mtu`."""
-    try:
-        interface = ipaddress.IPv4Interface(address)
-    except ValueError:
-        raise TunError(
-            f"tun_address {address!r} must be an IPv4 address with a prefix, like 10.8.0.1/24"
-        ) from None
+    interface = _ipv4_interface(address)
     return [
         [
             "netsh", "interface", "ipv4", "set", "address", f"name={index}",
